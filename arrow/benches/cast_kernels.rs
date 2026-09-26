@@ -260,6 +260,22 @@ fn cast_array(array: &ArrayRef, to_type: DataType) {
 fn add_benchmark(c: &mut Criterion) {
     let i32_array = build_array::<Int32Type>(512);
     let i64_array = build_array::<Int64Type>(512);
+    // No nulls, with about one value in seven outside the target range.
+    let i64_mostly_i32 = Arc::new(create_primitive_array_range::<Int64Type>(
+        512,
+        0.0,
+        -2_500_000_000..2_500_000_000,
+    )) as ArrayRef;
+    let f64_mostly_i32 = Arc::new(create_primitive_array_range::<Float64Type>(
+        512,
+        0.0,
+        -2.5e9..2.5e9,
+    )) as ArrayRef;
+    let date64_in_range = Arc::new(create_primitive_array_range::<Date64Type>(
+        512,
+        0.0,
+        0..4_000_000_000_000,
+    )) as ArrayRef;
     let f32_array = build_array::<Float32Type>(512);
     let f32_utf8_array = cast(&build_array::<Float32Type>(512), &DataType::Utf8).unwrap();
     let i32_utf8_array = cast(&build_array::<Int32Type>(512), &DataType::Utf8).unwrap();
@@ -330,6 +346,15 @@ fn add_benchmark(c: &mut Criterion) {
     });
     c.bench_function("cast int64 to int32 512", |b| {
         b.iter(|| cast_array(&i64_array, DataType::Int32))
+    });
+    c.bench_function("cast int64 to int32 no_nulls 512", |b| {
+        b.iter(|| cast_array(&i64_mostly_i32, DataType::Int32))
+    });
+    c.bench_function("cast float64 to int32 no_nulls 512", |b| {
+        b.iter(|| cast_array(&f64_mostly_i32, DataType::Int32))
+    });
+    c.bench_function("cast date64 to date32 no_nulls 512", |b| {
+        b.iter(|| cast_array(&date64_in_range, DataType::Date32))
     });
     c.bench_function("cast int64 to decimal32(9, 0) 512", |b| {
         b.iter(|| cast_array(&i64_array, DataType::Decimal32(9, 0)))

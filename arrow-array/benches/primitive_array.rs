@@ -18,24 +18,26 @@
 use std::hint;
 
 use arrow_array::Int32Array;
-use arrow_array::types::Int32Type;
+use arrow_array::types::{Int16Type, Int32Type};
 use criterion::{Criterion, criterion_group, criterion_main};
 
-const BATCH_SIZE: usize = 64 * 1024;
+const BATCH_SIZES: [usize; 3] = [1024, 8192, 64 * 1024];
 
 fn primitive_array_unary(c: &mut Criterion) {
-    let arrays = [
-        (
-            "no_input_nulls",
-            Int32Array::from_iter_values(0..BATCH_SIZE as i32),
-        ),
-        (
-            "20pct_input_nulls",
-            Int32Array::from_iter(
-                (0..BATCH_SIZE as i32).map(|value| (value % 5 != 0).then_some(value)),
+    let arrays = BATCH_SIZES.into_iter().flat_map(|size| {
+        [
+            (
+                format!("no_input_nulls/{size}"),
+                Int32Array::from_iter_values(0..size as i32),
             ),
-        ),
-    ];
+            (
+                format!("20pct_input_nulls/{size}"),
+                Int32Array::from_iter(
+                    (0..size as i32).map(|value| (value % 5 != 0).then_some(value)),
+                ),
+            ),
+        ]
+    });
 
     let mut group = c.benchmark_group("primitive_array_unary");
     for (name, array) in arrays {
@@ -52,6 +54,14 @@ fn primitive_array_unary(c: &mut Criterion) {
             b.iter(|| {
                 hint::black_box(
                     array.unary_opt::<_, Int32Type>(|value| (value % 7 != 0).then_some(value + 1)),
+                )
+            })
+        });
+        // A narrowing cast: a range check that fails on about one row in seven.
+        group.bench_function(format!("unary_opt_narrow/{name}"), |b| {
+            b.iter(|| {
+                hint::black_box(
+                    array.unary_opt::<_, Int16Type>(|value| i16::try_from(value % 38_000).ok()),
                 )
             })
         });
