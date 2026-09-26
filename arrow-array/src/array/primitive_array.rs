@@ -26,7 +26,9 @@ use crate::timezone::Tz;
 use crate::trusted_len::trusted_len_unzip;
 use crate::types::*;
 use crate::{Array, ArrayAccessor, ArrayRef, Scalar};
-use arrow_buffer::{ArrowNativeType, Buffer, NullBuffer, NullBufferBuilder, ScalarBuffer, i256};
+use arrow_buffer::{
+    ArrowNativeType, BooleanBuffer, Buffer, NullBuffer, NullBufferBuilder, ScalarBuffer, i256,
+};
 use arrow_data::bit_iterator::try_for_each_valid_idx;
 use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::{ArrowError, DataType};
@@ -621,6 +623,37 @@ impl<T: ArrowPrimitiveType> Clone for PrimitiveArray<T> {
     }
 }
 
+/// Applies `op` to every value of `chunk`, at most 64 of them, writing each
+/// result or its default to `out` and returning one validity bit per row.
+///
+/// Taking both slices as parameters tells the compiler they do not overlap,
+/// which it needs in order to vectorize the loop. The validity is first
+/// written as one byte per row, which vectorizes as well, and then packed
+/// eight bytes at a time.
+#[inline]
+fn unary_opt_chunk<T, O, F>(out: &mut [O], chunk: &[T], op: &F) -> u64
+where
+    T: ArrowNativeType,
+    O: ArrowNativeType,
+    F: Fn(T) -> Option<O>,
+{
+    let mut valid = [0u8; 64];
+    for ((out, &v), valid) in out.iter_mut().zip(chunk).zip(valid.iter_mut()) {
+        let result = op(v);
+        *out = result.unwrap_or_default();
+        *valid = result.is_some() as u8;
+    }
+    let mut packed = 0u64;
+    for (i, bytes) in valid.as_chunks::<8>().0.iter().enumerate() {
+        // Each byte is 0 or 1. The product's top byte gathers byte `j` at bit
+        // `j`, since the constant places each partial product at a distinct
+        // bit and only those for the top byte reach it.
+        let word = u64::from_le_bytes(*bytes);
+        packed |= (word.wrapping_mul(0x0102_0408_1020_4080) >> 56) << (8 * i);
+    }
+    packed
+}
+
 impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
     /// Create a new [`PrimitiveArray`] from the provided values and nulls
     ///
@@ -1069,9 +1102,7 @@ impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
     ///
     /// Applies `op` to only rows that are valid, which is often significantly
     /// slower than [`Self::unary`], which should be preferred if `op` is
-    /// fallible.
-    ///
-    /// Note: LLVM is currently unable to effectively vectorize fallible operations
+    /// infallible.
     pub fn unary_opt<F, O>(&self, op: F) -> PrimitiveArray<O>
     where
         O: ArrowPrimitiveType,
@@ -1082,6 +1113,30 @@ impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
             Some(n) => (Some(n.validity()), n.null_count(), n.offset()),
             None => (None, 0, 0),
         };
+
+        // When every row is valid, `op` runs on every value. We evaluate the
+        // closure carefully to allow vectorization: rather than recording the
+        // closure success in a single bitmap (where eight consecutive rows
+        // would update the same byte in turn), we invoke the closure on chunks
+        // of 64 rows at a time, recording success with a byte per row, and then
+        // pack the resulting bytes into validity bits afterward. This strategy
+        // only wins for element types of at most 8 bytes, the widest lane that
+        // typical vector instructions operate on.
+        let narrow = const { size_of::<T::Native>() <= 8 && size_of::<O::Native>() <= 8 };
+        if null_count == 0 && narrow {
+            let mut values = vec![O::Native::default(); len];
+            let mut validity: Vec<u64> = Vec::with_capacity(len.div_ceil(64));
+            let mut out_null_count = 0;
+            for (out, chunk) in values.chunks_mut(64).zip(self.values().chunks(64)) {
+                let packed = unary_opt_chunk(out, chunk, &op);
+                out_null_count += chunk.len() - packed.count_ones() as usize;
+                validity.push(packed);
+            }
+            let validity = BooleanBuffer::new(Buffer::from_vec(validity), 0, len);
+            // SAFETY: `out_null_count` counts the cleared bits of `validity`.
+            let nulls = unsafe { NullBuffer::new_unchecked(validity, out_null_count) };
+            return PrimitiveArray::new(values.into(), Some(nulls));
+        }
 
         let mut null_builder = BooleanBufferBuilder::new(len);
         match nulls {
@@ -2883,6 +2938,36 @@ mod tests {
         let r = expected.unary_opt::<_, Int32Type>(|x| (x % 3 != 0).then_some(x));
         let expected = Int32Array::from(vec![Some(1), None, None, None, Some(5), None, Some(7)]);
         assert_eq!(r, expected);
+    }
+
+    #[test]
+    fn test_unary_opt_without_nulls() {
+        // Failures at the edges of the 64-row words and at the end of the array.
+        fn op(x: i32) -> Option<i32> {
+            (x % 64 != 0 && x % 64 != 63 && x != 199).then_some(x * 2)
+        }
+        let values: Vec<i32> = (0..200).collect();
+        let expected = Int32Array::from_iter(values.iter().map(|&x| op(x)));
+        let array = Int32Array::from(values.clone());
+        assert_eq!(array.unary_opt::<_, Int32Type>(op), expected);
+        assert_eq!(
+            array.slice(1, 150).unary_opt::<_, Int32Type>(op),
+            expected.slice(1, 150)
+        );
+        // An all-valid null buffer takes the same path as no null buffer.
+        let array = Int32Array::new(values.into(), Some(NullBuffer::new_valid(200)));
+        assert_eq!(array.unary_opt::<_, Int32Type>(op), expected);
+
+        let array = Int32Array::from(vec![1, 2, 3]);
+        let result = array.unary_opt::<_, Int32Type>(Some);
+        assert_eq!(result, array);
+        assert_eq!(result.null_count(), 0);
+        assert_eq!(
+            Int32Array::new_null(0)
+                .unary_opt::<_, Int32Type>(Some)
+                .len(),
+            0
+        );
     }
 
     #[test]
