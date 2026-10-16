@@ -19,17 +19,34 @@
 extern crate criterion;
 use criterion::Criterion;
 
-use rand::RngExt;
+use std::sync::Arc;
+
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 
 use arrow::array::*;
 use arrow::datatypes::Int32Type;
 use arrow::util::bench_util::{
-    create_dict_from_values, create_string_array, create_string_view_array,
+    create_string_array_with_len_range_and_prefix_and_seed,
+    create_string_view_array_with_len_range_and_seed,
 };
-use arrow::util::test_util::seedable_rng;
 
-fn create_slices(size: usize) -> Vec<(usize, usize)> {
-    let rng = &mut seedable_rng();
+/// Each benchmark cycles through this many arrays and lists of slices, one per
+/// iteration.
+const NUM_INPUTS: usize = 64;
+
+/// `NUM_INPUTS` values made by `make` from the seeds `0..NUM_INPUTS`
+fn per_seed<T>(make: impl FnMut(u64) -> T) -> Vec<T> {
+    (0..NUM_INPUTS as u64).map(make).collect()
+}
+
+/// `size` random strings of 0 to 399 bytes
+fn create_strings(size: usize, null_density: f32, seed: u64) -> StringArray {
+    create_string_array_with_len_range_and_prefix_and_seed(size, null_density, 0, 399, "", seed)
+}
+
+fn create_slices(size: usize, seed: u64) -> Vec<(usize, usize)> {
+    let rng = &mut StdRng::seed_from_u64(seed);
 
     (0..size)
         .map(|_| {
@@ -42,8 +59,8 @@ fn create_slices(size: usize) -> Vec<(usize, usize)> {
 
 /// Slices of 1 to 8 rows, like the runs that `zip` copies for a `CASE`
 /// expression whose condition changes often.
-fn create_short_slices(size: usize) -> Vec<(usize, usize)> {
-    let rng = &mut seedable_rng();
+fn create_short_slices(size: usize, seed: u64) -> Vec<(usize, usize)> {
+    let rng = &mut StdRng::seed_from_u64(seed);
 
     (0..size)
         .map(|_| {
@@ -52,6 +69,13 @@ fn create_short_slices(size: usize) -> Vec<(usize, usize)> {
             (start, start + len)
         })
         .collect()
+}
+
+/// A dictionary array of `size` random keys into 16 random strings
+fn create_dict_array(size: usize, seed: u64) -> DictionaryArray<Int32Type> {
+    let rng = &mut StdRng::seed_from_u64(seed);
+    let keys = Int32Array::from_iter_values((0..size).map(|_| rng.random_range(0..16)));
+    DictionaryArray::new(keys, Arc::new(create_strings(16, 0.0, seed)))
 }
 
 /// Total number of rows in `slices`
@@ -70,34 +94,47 @@ fn bench<T: Array>(v1: &T, slices: &[(usize, usize)], len: usize) {
     mutable.freeze();
 }
 
+/// Benchmarks [`bench`], where iteration `i` copies list `i % NUM_INPUTS` of
+/// `slices` from array `i % NUM_INPUTS` of `arrays`.
+fn bench_inputs<T: Array>(
+    c: &mut Criterion,
+    name: &str,
+    arrays: &[T],
+    slices: &[Vec<(usize, usize)>],
+) {
+    let lens: Vec<usize> = slices.iter().map(|slices| total_len(slices)).collect();
+    let mut inputs = arrays.iter().zip(slices).zip(&lens).cycle();
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            let ((array, slices), len) = inputs.next().unwrap();
+            bench(array, slices, *len)
+        })
+    });
+}
+
 fn add_benchmark(c: &mut Criterion) {
-    let v1 = create_string_array::<i32>(1024, 0.0);
-    let v2 = create_slices(1024);
-    let v2_len = total_len(&v2);
-    c.bench_function("mutable str 1024", |b| b.iter(|| bench(&v1, &v2, v2_len)));
+    let long_slices = per_seed(|seed| create_slices(1024, seed));
+    let short_slices = per_seed(|seed| create_short_slices(1024, seed));
 
-    let v1 = create_string_array::<i32>(1024, 0.5);
-    c.bench_function("mutable str nulls 1024", |b| {
-        b.iter(|| bench(&v1, &v2, v2_len))
-    });
+    let strings = per_seed(|seed| create_strings(1024, 0.0, seed));
+    bench_inputs(c, "mutable str 1024", &strings, &long_slices);
 
-    let short_slices = create_short_slices(1024);
-    let short_len = total_len(&short_slices);
+    let strings = per_seed(|seed| create_strings(1024, 0.5, seed));
+    bench_inputs(c, "mutable str nulls 1024", &strings, &long_slices);
 
-    let v1 = create_string_view_array(1024, 0.0);
-    c.bench_function("mutable str_view 1024", |b| {
-        b.iter(|| bench(&v1, &v2, v2_len))
-    });
-    c.bench_function("mutable str_view short slices 1024", |b| {
-        b.iter(|| bench(&v1, &short_slices, short_len))
-    });
+    let views =
+        per_seed(|seed| create_string_view_array_with_len_range_and_seed(1024, 0.0, 0..400, seed));
+    bench_inputs(c, "mutable str_view 1024", &views, &long_slices);
+    bench_inputs(
+        c,
+        "mutable str_view short slices 1024",
+        &views,
+        &short_slices,
+    );
 
-    let values = create_string_array::<i32>(16, 0.0);
-    let v1 = create_dict_from_values::<Int32Type>(1024, 0.0, &values);
-    c.bench_function("mutable dict 1024", |b| b.iter(|| bench(&v1, &v2, v2_len)));
-    c.bench_function("mutable dict short slices 1024", |b| {
-        b.iter(|| bench(&v1, &short_slices, short_len))
-    });
+    let dicts = per_seed(|seed| create_dict_array(1024, seed));
+    bench_inputs(c, "mutable dict 1024", &dicts, &long_slices);
+    bench_inputs(c, "mutable dict short slices 1024", &dicts, &short_slices);
 }
 
 criterion_group!(benches, add_benchmark);

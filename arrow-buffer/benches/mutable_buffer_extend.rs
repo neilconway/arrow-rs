@@ -17,8 +17,8 @@
 
 //! Benchmarks for appending iterators to a [`MutableBuffer`] with `extend`.
 //!
-//! Each case appends `LEN` items in calls of `chunk` items, into a buffer
-//! that already has enough capacity.
+//! Each case appends `LEN` items, in calls of random lengths that average
+//! `chunk` items, into a buffer that already has enough capacity.
 
 use arrow_buffer::{ArrowNativeType, MutableBuffer};
 use criterion::*;
@@ -29,20 +29,52 @@ use std::ops::Range;
 
 const LEN: usize = 1 << 15;
 
-/// Benchmarks a case whose calls append the iterators `make(range)` for the
-/// consecutive `chunk`-item ranges of `0..LEN`.
+/// Each case cycles through this many inputs, one per iteration. An input is a
+/// list of call lengths, plus an array of items for cases that read them.
+const NUM_INPUTS: usize = 16;
+
+/// `NUM_INPUTS` arrays of `LEN` items made by `item`
+fn random_inputs<T>(mut item: impl FnMut() -> T) -> Vec<Vec<T>> {
+    (0..NUM_INPUTS)
+        .map(|_| (0..LEN).map(|_| item()).collect())
+        .collect()
+}
+
+/// `NUM_INPUTS` splits of `0..LEN` into consecutive ranges of 1 to
+/// `2 * chunk - 1` items
+fn random_calls(rng: &mut StdRng, chunk: usize) -> Vec<Vec<Range<usize>>> {
+    (0..NUM_INPUTS)
+        .map(|_| {
+            let mut calls = vec![];
+            let mut start = 0;
+            while start < LEN {
+                let end = LEN.min(start + rng.random_range(1..2 * chunk));
+                calls.push(start..end);
+                start = end;
+            }
+            calls
+        })
+        .collect()
+}
+
+/// Benchmarks a case whose calls append the iterators `make(input, range)` for
+/// the ranges in `calls[input]`, where successive iterations cycle `input`
+/// through `0..NUM_INPUTS`.
 fn bench_extend<I: Iterator<Item: ArrowNativeType>>(
     group: &mut BenchmarkGroup<'_, measurement::WallTime>,
     name: &str,
     chunk: usize,
-    make: impl Fn(Range<usize>) -> I,
+    calls: &[Vec<Range<usize>>],
+    make: impl Fn(usize, Range<usize>) -> I,
 ) {
     let mut buffer = MutableBuffer::new(LEN * size_of::<I::Item>());
+    let mut inputs = (0..NUM_INPUTS).cycle();
     group.bench_function(BenchmarkId::new(name, chunk), |b| {
         b.iter(|| {
+            let input = inputs.next().unwrap();
             buffer.clear();
-            for start in (0..LEN).step_by(chunk) {
-                buffer.extend(make(start..start + chunk));
+            for range in &calls[input] {
+                buffer.extend(make(input, range.clone()));
             }
             hint::black_box(buffer.as_slice());
         })
@@ -51,9 +83,9 @@ fn bench_extend<I: Iterator<Item: ArrowNativeType>>(
 
 fn criterion_benchmark(c: &mut Criterion) {
     let mut rng = StdRng::seed_from_u64(42);
-    let bytes: Vec<u8> = (0..LEN).map(|_| rng.random_range(b'a'..=b'z')).collect();
-    let keys: Vec<i32> = (0..LEN).map(|_| rng.random_range(0..1000)).collect();
-    let wide: Vec<u128> = (0..LEN).map(|_| rng.random_range(0..1 << 100)).collect();
+    let bytes = random_inputs(|| rng.random_range(b'a'..=b'z'));
+    let keys: Vec<Vec<i32>> = random_inputs(|| rng.random_range(0..1000));
+    let wide: Vec<Vec<u128>> = random_inputs(|| rng.random_range(0..1 << 100));
 
     // Read at run time so the compiler can't specialize the maps for them.
     let (from, to) = hint::black_box((b'a', b'z'));
@@ -62,36 +94,40 @@ fn criterion_benchmark(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("MutableBuffer extend");
     for chunk in [16, 1024] {
-        bench_extend(&mut group, "copied u8", chunk, |r| bytes[r].iter().copied());
+        let calls = random_calls(&mut rng, chunk);
+        bench_extend(&mut group, "copied u8", chunk, &calls, |input, r| {
+            bytes[input][r].iter().copied()
+        });
         // Like replacing one byte with another in a string.
-        bench_extend(&mut group, "map u8", chunk, |r| {
-            bytes[r]
+        bench_extend(&mut group, "map u8", chunk, &calls, |input, r| {
+            bytes[input][r]
                 .iter()
                 .map(move |&b| if b == from { to } else { b })
         });
         // Like copying dictionary keys in `MutableArrayData`.
-        bench_extend(&mut group, "map i32", chunk, |r| {
-            keys[r].iter().map(move |k| k + key_offset)
+        bench_extend(&mut group, "map i32", chunk, &calls, |input, r| {
+            keys[input][r].iter().map(move |k| k + key_offset)
         });
-        bench_extend(&mut group, "map u128", chunk, |r| {
-            wide[r].iter().map(move |v| v + wide_offset)
+        bench_extend(&mut group, "map u128", chunk, &calls, |input, r| {
+            wide[input][r].iter().map(move |v| v + wide_offset)
         });
         // Like dense union offsets in `MutableArrayData`.
-        bench_extend(&mut group, "range i32", chunk, |r| {
+        bench_extend(&mut group, "range i32", chunk, &calls, |_, r| {
             r.start as i32..r.end as i32
         });
         // Like `BufferBuilder::append_n`.
-        bench_extend(&mut group, "repeat_n u32", chunk, |r| {
-            std::iter::repeat_n(r.start as u32, chunk)
+        bench_extend(&mut group, "repeat_n u32", chunk, &calls, |_, r| {
+            std::iter::repeat_n(r.start as u32, r.len())
         });
-        bench_extend(&mut group, "chain i32", chunk, |r| {
-            let (lo, hi) = keys[r].split_at(chunk / 2);
+        bench_extend(&mut group, "chain i32", chunk, &calls, |input, r| {
+            let mid = r.len() / 2;
+            let (lo, hi) = keys[input][r].split_at(mid);
             lo.iter().chain(hi).copied()
         });
         // The size hint is not exact. The predicate always passes, so the
         // branch is predictable.
-        bench_extend(&mut group, "filter i32", chunk, |r| {
-            keys[r].iter().copied().filter(|&k| k >= 0)
+        bench_extend(&mut group, "filter i32", chunk, &calls, |input, r| {
+            keys[input][r].iter().copied().filter(|&k| k >= 0)
         });
     }
     group.finish();
